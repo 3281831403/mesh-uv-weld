@@ -1,4 +1,4 @@
-"""网格顶点焊接核心。所有函数目前都是桩：契约写在 docstring 里，实现留空。
+"""网格顶点焊接核心。
 
 约定
 ----
@@ -18,8 +18,6 @@
 * 只用标准库 ``math``，不使用随机数，相同输入必须得到相同输出。
 * 非法输入（缺少字段、数组长度不一致、下标越界、非有限坐标、非正 epsilon）
   抛 :class:`WeldError`；``validate`` 是例外，它把问题收集成字符串列表返回。
-
-每个公开函数都只抛 ``NotImplementedError``，等待实现。
 """
 
 import math
@@ -39,6 +37,9 @@ __all__ = [
 #: 全局几何/UV 比较容差。
 EPS = 1e-6
 
+#: 网格的四个必需字段。
+_FIELDS = ("positions", "uvs", "normals", "indices")
+
 
 class WeldError(Exception):
     """顶点焊接中的非法输入、非法参数或批量操作失败时抛出。
@@ -48,6 +49,142 @@ class WeldError(Exception):
     * 顶点下标越界、坐标/法线/UV 含 NaN 或无穷大时抛出；
     * 批量焊接中任一网格非法时抛出，且不能返回或写出任何部分结果（整批回滚）。
     """
+
+
+# --------------------------------------------------------------------------- #
+# 内部校验辅助
+# --------------------------------------------------------------------------- #
+
+
+def _check_epsilon(epsilon):
+    """校验量化步长并返回 float。"""
+    try:
+        value = float(epsilon)
+    except (TypeError, ValueError):
+        raise WeldError("epsilon must be a finite positive number")
+    if not math.isfinite(value) or value <= 0.0:
+        raise WeldError("epsilon must be a finite positive number")
+    return value
+
+
+def _check_number(value, what):
+    """把单个分量转成有限 float，否则抛 WeldError。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise WeldError("%s is not a number" % what)
+    if not math.isfinite(number):
+        raise WeldError("%s is not finite" % what)
+    return number
+
+
+def _check_vector(vector, size, what):
+    """校验定长数值向量，返回 float 列表。"""
+    if not isinstance(vector, (list, tuple)) or len(vector) != size:
+        raise WeldError("%s must have %d components" % (what, size))
+    return [_check_number(component, "%s[%d]" % (what, i))
+            for i, component in enumerate(vector)]
+
+
+def _check_mesh(mesh):
+    """校验网格结构与数值，返回 ``(positions, uvs, normals, triangles)``。
+
+    ``triangles`` 是 ``tuple[int, int, int]`` 的列表。返回的顶点数组仍是输入
+    对象，实现只读不写。
+    """
+    if not isinstance(mesh, dict):
+        raise WeldError("mesh must be a dict")
+    arrays = {}
+    for name in _FIELDS:
+        if name not in mesh:
+            raise WeldError("mesh is missing field %r" % name)
+        if not isinstance(mesh[name], (list, tuple)):
+            raise WeldError("mesh field %r must be a list" % name)
+        arrays[name] = mesh[name]
+
+    positions = arrays["positions"]
+    uvs = arrays["uvs"]
+    normals = arrays["normals"]
+    count = len(positions)
+    if len(uvs) != count:
+        raise WeldError("uvs length %d does not match positions length %d"
+                        % (len(uvs), count))
+    if len(normals) != count:
+        raise WeldError("normals length %d does not match positions length %d"
+                        % (len(normals), count))
+
+    for i, position in enumerate(positions):
+        _check_vector(position, 3, "positions[%d]" % i)
+    for i, uv in enumerate(uvs):
+        _check_vector(uv, 2, "uvs[%d]" % i)
+    for i, normal in enumerate(normals):
+        _check_vector(normal, 3, "normals[%d]" % i)
+
+    triangles = []
+    for triangle_index, triangle in enumerate(arrays["indices"]):
+        if not isinstance(triangle, (list, tuple)) or len(triangle) != 3:
+            raise WeldError("indices[%d] is not a triangle" % triangle_index)
+        parsed = []
+        for corner, index in enumerate(triangle):
+            if not isinstance(index, int):
+                raise WeldError("indices[%d][%d] is not an integer index"
+                                % (triangle_index, corner))
+            if index < 0 or index >= count:
+                raise WeldError("indices[%d][%d] index %d out of range of %d vertices"
+                                % (triangle_index, corner, index, count))
+            parsed.append(index)
+        triangles.append(tuple(parsed))
+
+    return positions, uvs, normals, triangles
+
+
+def _quantize(value, epsilon):
+    """安全的 ``floor(value / epsilon)``。"""
+    try:
+        return math.floor(value / epsilon)
+    except (OverflowError, ValueError):
+        raise WeldError("position cannot be quantized with the given epsilon")
+
+
+def _position_key(position, epsilon):
+    """把已校验的三维位置量化成整数键（向下取整）。"""
+    return (
+        _quantize(float(position[0]), epsilon),
+        _quantize(float(position[1]), epsilon),
+        _quantize(float(position[2]), epsilon),
+    )
+
+
+def _triangle_area(positions, triangle):
+    """三维三角形面积 ``0.5 * |(b - a) x (c - a)|``。"""
+    ax, ay, az = (float(c) for c in positions[triangle[0]])
+    bx, by, bz = (float(c) for c in positions[triangle[1]])
+    cx, cy, cz = (float(c) for c in positions[triangle[2]])
+    ux, uy, uz = bx - ax, by - ay, bz - az
+    vx, vy, vz = cx - ax, cy - ay, cz - az
+    nx = uy * vz - uz * vy
+    ny = uz * vx - ux * vz
+    nz = ux * vy - uy * vx
+    return 0.5 * math.sqrt(nx * nx + ny * ny + nz * nz)
+
+
+def _copy_vectors(vectors):
+    """逐个复制向量，避免输出与输入共享可变列表。"""
+    return [list(vector) for vector in vectors]
+
+
+def _find_uv_group(groups, u, v):
+    """在已登记的 UV 代表中找容差范围内匹配的，返回其新下标或 ``-1``。"""
+    for candidate_u, candidate_v, new_index in groups:
+        if (abs(u - candidate_u) <= EPS
+                and abs(v - candidate_v) <= EPS):
+            return new_index
+    return -1
+
+
+# --------------------------------------------------------------------------- #
+# 公开接口
+# --------------------------------------------------------------------------- #
 
 
 def key_for(pos, epsilon):
@@ -73,7 +210,9 @@ def key_for(pos, epsilon):
     WeldError
         ``epsilon`` 不是有限正数；``pos`` 不是长度为 3 的有限坐标。
     """
-    raise NotImplementedError
+    step = _check_epsilon(epsilon)
+    values = _check_vector(pos, 3, "pos")
+    return tuple(_quantize(value, step) for value in values)
 
 
 def weld_positions(mesh, epsilon):
@@ -104,7 +243,23 @@ def weld_positions(mesh, epsilon):
     WeldError
         网格缺字段/长度不一致、``epsilon <= 0``、下标越界或坐标非有限。
     """
-    raise NotImplementedError
+    step = _check_epsilon(epsilon)
+    positions, _uvs, _normals, triangles = _check_mesh(mesh)
+
+    representatives = {}
+    merged_positions = []
+    remap = []
+    for old_index, position in enumerate(positions):
+        key = _position_key(position, step)
+        new_index = representatives.get(key)
+        if new_index is None:
+            new_index = len(merged_positions)
+            representatives[key] = new_index
+            merged_positions.append(list(position))
+        remap.append(new_index)
+
+    indices = [[remap[index] for index in triangle] for triangle in triangles]
+    return {"positions": merged_positions, "indices": indices, "remap": remap}
 
 
 def preserve_seams(mesh, epsilon):
@@ -135,7 +290,33 @@ def preserve_seams(mesh, epsilon):
         网格字段缺失/长度不一致、``epsilon <= 0``、下标越界、UV 数量不匹配
         或坐标非有限。
     """
-    raise NotImplementedError
+    step = _check_epsilon(epsilon)
+    positions, uvs, _normals, triangles = _check_mesh(mesh)
+
+    # 每个位置键 -> [(u, v, 新下标), ...]，逐个与代表 UV 做容差比较。
+    groups = {}
+    merged_positions = []
+    merged_uvs = []
+    remap = []
+    for old_index, position in enumerate(positions):
+        key = _position_key(position, step)
+        u, v = float(uvs[old_index][0]), float(uvs[old_index][1])
+        candidates = groups.setdefault(key, [])
+        new_index = _find_uv_group(candidates, u, v)
+        if new_index < 0:
+            new_index = len(merged_positions)
+            candidates.append((u, v, new_index))
+            merged_positions.append(list(position))
+            merged_uvs.append([u, v])
+        remap.append(new_index)
+
+    indices = [[remap[index] for index in triangle] for triangle in triangles]
+    return {
+        "positions": merged_positions,
+        "uvs": merged_uvs,
+        "indices": indices,
+        "remap": remap,
+    }
 
 
 def remove_degenerate(mesh):
@@ -163,7 +344,15 @@ def remove_degenerate(mesh):
     WeldError
         网格字段缺失/长度不一致、下标越界或存在非有限坐标。
     """
-    raise NotImplementedError
+    positions, uvs, normals, triangles = _check_mesh(mesh)
+    kept = [list(triangle) for triangle in triangles
+            if _triangle_area(positions, triangle) > EPS]
+    return {
+        "positions": _copy_vectors(positions),
+        "uvs": _copy_vectors(uvs),
+        "normals": _copy_vectors(normals),
+        "indices": kept,
+    }
 
 
 def compact(mesh):
@@ -193,7 +382,21 @@ def compact(mesh):
     WeldError
         网格字段缺失/长度不一致、下标越界或存在非有限坐标。
     """
-    raise NotImplementedError
+    positions, uvs, normals, triangles = _check_mesh(mesh)
+
+    referenced = sorted({index for triangle in triangles for index in triangle})
+    old_to_new = {old: new for new, old in enumerate(referenced)}
+    remap = [old_to_new.get(old, -1) for old in range(len(positions))]
+
+    indices = [[old_to_new[index] for index in triangle]
+               for triangle in triangles]
+    return {
+        "positions": [list(positions[old]) for old in referenced],
+        "uvs": [list(uvs[old]) for old in referenced],
+        "normals": [list(normals[old]) for old in referenced],
+        "indices": indices,
+        "remap": remap,
+    }
 
 
 def merge_uv_islands(mesh, epsilon):
@@ -227,7 +430,70 @@ def merge_uv_islands(mesh, epsilon):
         网格字段缺失/长度不一致、``epsilon <= 0``、下标越界、UV 数量不匹配
         或坐标非有限。
     """
-    raise NotImplementedError
+    step = _check_epsilon(epsilon)
+    positions, uvs, _normals, triangles = _check_mesh(mesh)
+
+    # 并查集：共享一条无向边的三角形属于同一个 UV 岛。
+    parent = list(range(len(triangles)))
+
+    def find(item):
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(left, right):
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    edge_owner = {}
+    for triangle_index, triangle in enumerate(triangles):
+        a, b, c = triangle
+        for edge in ((a, b), (b, c), (c, a)):
+            edge_key = (min(edge), max(edge))
+            if edge_key in edge_owner:
+                union(triangle_index, edge_owner[edge_key])
+            else:
+                edge_owner[edge_key] = triangle_index
+
+    # 每个顶点所属岛的签名。只由顶点相连的三角形（可能与多个岛相连）的根组成，
+    # 因此仅共享顶点的两个岛不会混为一谈。
+    vertex_islands = [set() for _ in positions]
+    for triangle_index, triangle in enumerate(triangles):
+        root = find(triangle_index)
+        for vertex in triangle:
+            vertex_islands[vertex].add(root)
+
+    groups = {}
+    merged_positions = []
+    merged_uvs = []
+    remap = []
+    for old_index, position in enumerate(positions):
+        islands = vertex_islands[old_index]
+        if islands:
+            signature = ("islands", tuple(sorted(islands)))
+        else:
+            # 未被任何三角形引用的顶点不属于任何岛，各自独立处理。
+            signature = ("unreferenced", old_index)
+        key = (signature, _position_key(position, step))
+        u, v = float(uvs[old_index][0]), float(uvs[old_index][1])
+        candidates = groups.setdefault(key, [])
+        new_index = _find_uv_group(candidates, u, v)
+        if new_index < 0:
+            new_index = len(merged_positions)
+            candidates.append((u, v, new_index))
+            merged_positions.append(list(position))
+            merged_uvs.append([u, v])
+        remap.append(new_index)
+
+    indices = [[remap[index] for index in triangle] for triangle in triangles]
+    return {
+        "positions": merged_positions,
+        "uvs": merged_uvs,
+        "indices": indices,
+        "remap": remap,
+    }
 
 
 def validate(mesh):
@@ -260,7 +526,104 @@ def validate(mesh):
     无。只要还能遍历输入就返回问题列表；无法遍历的极端输入可抛
     :class:`WeldError`。
     """
-    raise NotImplementedError
+    problems = []
+    if not isinstance(mesh, dict):
+        return ["mesh is not a dict"]
+
+    arrays = {}
+    for name in _FIELDS:
+        if name not in mesh:
+            problems.append("mesh is missing field %s" % name)
+        elif not isinstance(mesh[name], (list, tuple)):
+            problems.append("mesh field %s is not a list" % name)
+        else:
+            arrays[name] = list(mesh[name])
+
+    vertex_count = len(arrays["positions"]) if "positions" in arrays else None
+    for name in ("uvs", "normals"):
+        if name in arrays and vertex_count is not None:
+            if len(arrays[name]) != vertex_count:
+                problems.append(
+                    "%s length %d does not match positions length %d"
+                    % (name, len(arrays[name]), vertex_count))
+
+    def component_issues(vector, size, label):
+        """返回 (问题列表, 有限 float 列表或 None)。"""
+        if not isinstance(vector, (list, tuple)) or len(vector) != size:
+            return ["%s must have %d components" % (label, size)], None
+        issues = []
+        values = []
+        for k, component in enumerate(vector):
+            try:
+                number = float(component)
+            except (TypeError, ValueError):
+                issues.append("%s[%d] is not a number" % (label, k))
+                values.append(None)
+                continue
+            values.append(number)
+            if math.isnan(number):
+                issues.append("%s[%d] contains nan" % (label, k))
+            elif math.isinf(number):
+                issues.append("%s[%d] contains infinite value" % (label, k))
+        if any(value is None or not math.isfinite(value) for value in values):
+            return issues, None
+        return issues, values
+
+    position_values = []
+    if "positions" in arrays:
+        for i, vector in enumerate(arrays["positions"]):
+            issues, values = component_issues(vector, 3, "positions[%d]" % i)
+            problems.extend(issues)
+            position_values.append(values)
+    if "uvs" in arrays:
+        for i, vector in enumerate(arrays["uvs"]):
+            issues, _values = component_issues(vector, 2, "uvs[%d]" % i)
+            problems.extend(issues)
+    if "normals" in arrays:
+        for i, vector in enumerate(arrays["normals"]):
+            issues, _values = component_issues(vector, 3, "normals[%d]" % i)
+            problems.extend(issues)
+
+    valid_triangles = []
+    if "indices" in arrays:
+        for triangle_index, triangle in enumerate(arrays["indices"]):
+            if not isinstance(triangle, (list, tuple)) or len(triangle) != 3:
+                problems.append("indices[%d] is not a triangle" % triangle_index)
+                continue
+            parsed = []
+            usable = True
+            for corner, index in enumerate(triangle):
+                if not isinstance(index, int):
+                    problems.append("indices[%d][%d] is not an integer index"
+                                    % (triangle_index, corner))
+                    usable = False
+                    continue
+                if vertex_count is not None and not (0 <= index < vertex_count):
+                    problems.append(
+                        "indices[%d][%d] index %d out of range of %d vertices"
+                        % (triangle_index, corner, index, vertex_count))
+                    usable = False
+                    continue
+                parsed.append(index)
+            if usable:
+                valid_triangles.append((triangle_index, tuple(parsed)))
+
+    for triangle_index, triangle in valid_triangles:
+        corners = []
+        usable = True
+        for vertex in triangle:
+            if vertex >= len(position_values) or position_values[vertex] is None:
+                usable = False
+                break
+            corners.append(position_values[vertex])
+        if not usable:
+            continue
+        area = _triangle_area(corners, (0, 1, 2))
+        if area <= EPS:
+            problems.append("indices[%d] is degenerate (area %.6g <= %.6g)"
+                            % (triangle_index, area, EPS))
+
+    return problems
 
 
 def weld_batch(meshes, config):
@@ -291,4 +654,34 @@ def weld_batch(meshes, config):
         越界或坐标非有限。实现必须先验证再计算：任一网格失败时整批失败，
         不返回部分结果，也不得原地修改传入的网格（整体回滚）。
     """
-    raise NotImplementedError
+    if not isinstance(config, dict):
+        raise WeldError("config must be a dict")
+    if "epsilon" not in config:
+        raise WeldError("config is missing 'epsilon'")
+    step = _check_epsilon(config["epsilon"])
+    use_seams = bool(config.get("preserve_seams", False))
+
+    if isinstance(meshes, (list, tuple)):
+        batch = list(meshes)
+    else:
+        try:
+            batch = list(meshes)
+        except TypeError:
+            raise WeldError("meshes must be a sequence of meshes")
+
+    # 先验证整批，任一网格非法就整体失败，不产生部分结果。
+    for mesh in batch:
+        _check_mesh(mesh)
+
+    results = []
+    remaps = []
+    for mesh in batch:
+        if use_seams:
+            result = preserve_seams(mesh, step)
+        else:
+            result = weld_positions(mesh, step)
+        results.append(result)
+        # 每个网格各自持有一份 remap，绝不与其他网格共享。
+        remaps.append(list(result["remap"]))
+
+    return {"meshes": results, "remaps": remaps}
